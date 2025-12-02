@@ -8,4 +8,5 @@ dependencies = [
     "einops>=0.8.1",
     "ipykernel>=7.1.0",
     "torch>=2.9.1",
+    "transformers>=4.57.3",
 ]
