@@ -1,45 +1,85 @@
 """
-Adapted (with some parts copied) from https://github.com/johnma2006/mamba-minimal/blob/master/model.py
+Adapted (with parts copied) from https://github.com/johnma2006/mamba-minimal/blob/master/model.py
 """
+
+from dataclasses import dataclass
+import math
+from typing import Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from einops import einsum, rearrange
 
 
-class MambaBlock:
-    def __init__(
-        self, d_model: int, d_inner: int, d_state: int, use_conv_bias: bool, d_conv
-    ):
-        self.d_model = d_model
-        self.d_inner = d_inner
-        self.d_state = d_state
+@dataclass
+class ModelArgs:
+    """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
+
+    d_model: int
+    n_layer: int
+    vocab_size: int
+    d_state: int = 16
+    expand: int = 2
+    dt_rank: Union[int, str] = "auto"
+    d_conv: int = 4
+    pad_vocab_size_multiple: int = 8
+    conv_bias: bool = True
+    bias: bool = False
+
+    def __post_init__(self):
+        self.d_inner = int(self.expand * self.d_model)
+
+        if self.dt_rank == "auto":
+            self.dt_rank = math.ceil(self.d_model / 16)
+
+        if self.vocab_size % self.pad_vocab_size_multiple != 0:
+            self.vocab_size += (
+                self.pad_vocab_size_multiple
+                - self.vocab_size % self.pad_vocab_size_multiple
+            )
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        self.args = ModelArgs
+        self.norm = RMSNorm(d_model=args.d_model)
+        self.mamba_block = MambaBlock(args)
+
+    def forward(self, x: torch.Tensor):
+        y = self.mamba_block(self.norm(x))
+        y = y + x
+
+        return y
+
+
+class MambaBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        self.args = args
 
         # non-ssm stuff
-        self.in_proj = nn.Linear(d_model, d_inner)
-        self.residual_in_proj = nn.Linear(d_model, d_inner)
-        self.out_proj = nn.Linear(d_inner, d_model)
+        self.in_proj = nn.Linear(args.d_model, args.d_inner)
+        self.residual_in_proj = nn.Linear(args.d_model, args.d_inner)
+        self.out_proj = nn.Linear(args.d_inner, args.d_model)
         self.conv1d = nn.Conv1d(
-            in_channels=d_inner,
-            out_channels=d_inner,
-            bias=use_conv_bias,
-            kernel_size=d_conv,
-            groups=d_inner,
-            padding=d_conv - 1,
+            in_channels=args.d_inner,
+            out_channels=args.d_inner,
+            bias=args.use_conv_bias,
+            kernel_size=args.d_conv,
+            groups=args.d_inner,
+            padding=args.d_conv - 1,
         )
 
         # selective projections
-        self.s_B = nn.Linear(d_inner, d_state)
-        self.s_C = nn.Linear(d_inner, d_state)
-        self.s_Delta_linear = nn.Linear(d_inner, 1)
-        self.tau_Delta_param = nn.Parameter(torch.zeros(d_inner))
+        self.s_B = nn.Linear(args.d_inner, args.d_state)
+        self.s_C = nn.Linear(args.d_inner, args.d_state)
+        self.s_Delta_linear = nn.Linear(args.d_inner, 1)
+        self.tau_Delta_param = nn.Parameter(torch.zeros(args.d_inner))
 
         # other ssm stuff
         A = torch.arange(1, self.d_state + 1).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(d_inner))
+        self.D = nn.Parameter(torch.ones(args.d_inner))
 
     def forward(self, x: torch.Tensor):
         """_summary_
@@ -102,3 +142,17 @@ class MambaBlock:
         y = y + D * u
 
         return y
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        output = (
+            x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        )
+
+        return output
