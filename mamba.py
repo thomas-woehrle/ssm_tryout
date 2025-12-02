@@ -40,7 +40,35 @@ class ModelArgs:
             )
 
 
+class Mamba(nn.Module):
+    """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
+
+    def __init__(self, args: ModelArgs):
+        self.args = args
+
+        self.embedding = nn.Embedding(args.vocab_size, args.d_model)
+        self.layers = [ResidualBlock(args) for _ in range(args.n_layer)]
+        self.norm = RMSNorm(args.d_model)
+
+        self.lm_head = nn.Linear(args.d_model, args.vocab_size, bias=False)
+        self.lm_head.weight = self.embedding.weight
+
+    def forward(self, input_ids: torch.Tensor):
+        x = self.embedding(input_ids)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.norm(x)
+
+        logits = self.lm_head(x)
+
+        return logits
+
+
 class ResidualBlock(nn.Module):
+    """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
+
     def __init__(self, args: ModelArgs):
         self.args = ModelArgs
         self.norm = RMSNorm(d_model=args.d_model)
@@ -54,6 +82,8 @@ class ResidualBlock(nn.Module):
 
 
 class MambaBlock(nn.Module):
+    """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
+
     def __init__(self, args: ModelArgs):
         self.args = args
 
@@ -145,6 +175,8 @@ class MambaBlock(nn.Module):
 
 
 class RMSNorm(nn.Module):
+    """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
+
     def __init__(self, d_model: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
