@@ -45,11 +45,12 @@ class Mamba(nn.Module):
     """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
 
     def __init__(self, args: ModelArgs):
+        super().__init__()
         self.args = args
 
         self.embedding = nn.Embedding(args.vocab_size, args.d_model)
-        self.layers = [ResidualBlock(args) for _ in range(args.n_layer)]
-        self.norm = RMSNorm(args.d_model)
+        self.layers = nn.ModuleList([ResidualBlock(args) for _ in range(args.n_layer)])
+        self.norm_f = RMSNorm(args.d_model)
 
         self.lm_head = nn.Linear(args.d_model, args.vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
@@ -60,7 +61,7 @@ class Mamba(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        x = self.norm(x)
+        x = self.norm_f(x)
 
         logits = self.lm_head(x)
 
@@ -91,14 +92,17 @@ class Mamba(nn.Module):
             resolved_archive_file = cached_file(
                 model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False
             )
-            return json.load(open(resolved_archive_file))
+            return json.load(open(resolved_archive_file))  # pyright: ignore[reportArgumentType]
 
         def load_state_dict_hf(model_name, device=None, dtype=None):
             resolved_archive_file = cached_file(
                 model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False
             )
             return torch.load(
-                resolved_archive_file, weights_only=True, map_location="cpu", mmap=True
+                resolved_archive_file,  # pyright: ignore[reportArgumentType]
+                weights_only=True,
+                map_location="cpu",
+                mmap=True,
             )
 
         config_data = load_config_hf(pretrained_model_name)
@@ -123,12 +127,13 @@ class ResidualBlock(nn.Module):
     """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
 
     def __init__(self, args: ModelArgs):
-        self.args = ModelArgs
+        super().__init__()
+        self.args = args
         self.norm = RMSNorm(d_model=args.d_model)
-        self.mamba_block = MambaBlock(args)
+        self.mixer = MambaBlock(args)
 
     def forward(self, x: torch.Tensor):
-        y = self.mamba_block(self.norm(x))
+        y = self.mixer(self.norm(x))
         y = y + x
 
         return y
@@ -138,31 +143,34 @@ class MambaBlock(nn.Module):
     """Source: https://github.com/johnma2006/mamba-minimal/blob/master/model.py"""
 
     def __init__(self, args: ModelArgs):
+        super().__init__()
         self.args = args
 
         # non-ssm stuff
-        self.in_proj = nn.Linear(args.d_model, args.d_inner)
-        self.residual_in_proj = nn.Linear(args.d_model, args.d_inner)
-        self.out_proj = nn.Linear(args.d_inner, args.d_model)
+
+        # projection for ssm stream and residual stream
+        self.in_proj = nn.Linear(args.d_model, args.d_inner * 2, bias=args.bias)
+
         self.conv1d = nn.Conv1d(
             in_channels=args.d_inner,
             out_channels=args.d_inner,
-            bias=args.use_conv_bias,
+            bias=args.conv_bias,
             kernel_size=args.d_conv,
             groups=args.d_inner,
             padding=args.d_conv - 1,
         )
 
-        # selective projections
-        self.s_B = nn.Linear(args.d_inner, args.d_state)
-        self.s_C = nn.Linear(args.d_inner, args.d_state)
-        self.s_Delta_linear = nn.Linear(args.d_inner, 1)
-        self.tau_Delta_param = nn.Parameter(torch.zeros(args.d_inner))
+        assert isinstance(args.dt_rank, int)
+        self.x_proj = nn.Linear(
+            args.d_inner, args.dt_rank + args.d_state * 2, bias=False
+        )
 
-        # other ssm stuff
-        A = torch.arange(1, self.d_state + 1).repeat(self.d_inner, 1)
+        self.dt_proj = nn.Linear(args.dt_rank, args.d_inner, bias=True)
+
+        A = torch.arange(1, args.d_state + 1).repeat(args.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(args.d_inner))
+        self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=args.bias)
 
     def forward(self, x: torch.Tensor):
         """_summary_
@@ -170,8 +178,10 @@ class MambaBlock(nn.Module):
         Args:
             x: Input of shape (b, l, d)
         """
-        x = self.in_proj(x)
-        res_x = self.residual_in_proj(x)
+        x_and_res = self.in_proj(x)
+        (x, res) = x_and_res.split(
+            split_size=[self.args.d_inner, self.args.d_inner], dim=-1
+        )
 
         seq_l = x.shape[1]
         x = rearrange(x, "b l d_in -> b d_in l")
@@ -179,20 +189,25 @@ class MambaBlock(nn.Module):
         x = rearrange(x, "b d_in l -> b l d_in")
 
         x = F.silu(x)
-        res_x = F.silu(res_x)
+        res = F.silu(res)
 
         y = self.s6_ssm(x)
-        y = y * res_x
+        y = y * res
         y = self.out_proj(y)
 
         return y
 
     def s6_ssm(self, x: torch.Tensor) -> torch.Tensor:
-        B = self.s_B(x)
-        C = self.s_C(x)
-        Delta = F.softplus(self.tau_Delta_param + self.s_Delta_linear(x))
+        stuff = self.x_proj(x)
 
         A = -torch.exp(self.A_log)
+
+        Delta, B, C = stuff.split(
+            split_size=[self.args.dt_rank, self.args.d_state, self.args.d_state], dim=-1
+        )
+
+        Delta = self.dt_proj(Delta)
+        Delta = F.softplus(Delta)
 
         y = self.selective_scan(x, Delta, A, B, C, self.D)
 
@@ -205,7 +220,7 @@ class MambaBlock(nn.Module):
         A: torch.Tensor,
         B: torch.Tensor,
         C: torch.Tensor,
-        D: torch.tensor,
+        D: torch.Tensor,
     ) -> torch.Tensor:
         (b, seq_l, d_inner) = u.shape
         d_state = A.shape[1]
@@ -218,7 +233,7 @@ class MambaBlock(nn.Module):
 
         for i in range(seq_l):
             h = bar_A[:, i] * h + bar_B_u[:, i]
-            y = einsum(C[:, i], h, "b n, b d_in n -> b d")
+            y = einsum(C[:, i], h, "b n, b d_in n -> b d_in")
             ys.append(y)
 
         y = torch.stack(ys, dim=1)
